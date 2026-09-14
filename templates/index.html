@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>字幕节奏校对台</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<header id="toolbar">
+  <span class="brand">字幕节奏校对台</span>
+  <button id="btnOpenSub" class="btn">打开字幕…</button>
+  <button id="btnPaste" class="btn">粘贴字幕</button>
+  <button id="btnSample" class="btn">载入示例</button>
+  <span class="sep"></span>
+  <button id="btnOpenVideo" class="btn">打开视频…</button>
+  <span class="sep"></span>
+  <button id="btnUndo" class="btn" disabled title="Ctrl+Z">↩ 撤销</button>
+  <button id="btnRedo" class="btn" disabled title="Ctrl+Y / Ctrl+Shift+Z">↪ 重做</button>
+  <button id="btnBatchFix" class="btn warn" disabled>批量修复</button>
+  <button id="btnRevertAll" class="btn" disabled>全部恢复原始</button>
+  <span class="sep"></span>
+  <button id="btnSettings" class="btn">阈值设置</button>
+  <span class="spacer"></span>
+  <span id="statsBar" class="stats">未载入字幕</span>
+  <button id="btnExportSrt" class="btn primary" disabled>导出 SRT</button>
+  <button id="btnExportVtt" class="btn primary" disabled>导出 VTT</button>
+  <button id="btnSummary" class="btn primary" disabled>问题摘要</button>
+</header>
+
+<!-- 阈值设置面板 -->
+<section id="settingsPanel" class="hidden">
+  <label>CPS 上限（字/秒）<input type="number" id="setCps" step="1" min="1"></label>
+  <label>最短时长（秒）<input type="number" id="setMinDur" step="0.1" min="0.1"></label>
+  <label>最长时长（秒）<input type="number" id="setMaxDur" step="0.5" min="0.5"></label>
+  <label>最小间隔（秒）<input type="number" id="setMinGap" step="0.01" min="0"></label>
+  <label>单行字数<input type="number" id="setMaxChars" step="1" min="1"></label>
+  <label>断句短行阈值（字）<input type="number" id="setBreakShort" step="1" min="1"></label>
+  <label class="chk"><input type="checkbox" id="setPunct"> 启用标点断句检查</label>
+  <span class="hint">修改后即时重新校验</span>
+</section>
+
+<!-- 粘贴字幕面板 -->
+<section id="pastePanel" class="hidden">
+  <textarea id="pasteArea" rows="8" placeholder="把 SRT / VTT 文本粘贴到这里…"></textarea>
+  <div>
+    <button id="btnParsePaste" class="btn primary">解析</button>
+    <button id="btnClosePaste" class="btn">取消</button>
+  </div>
+</section>
+
+<main>
+  <div id="leftCol">
+    <div id="videoWrap">
+      <video id="player" controls></video>
+      <div id="overlay" class="hidden"></div>
+      <div id="noVideo">未载入视频 —— 字幕校对可正常进行，点击“打开视频…”联动画面</div>
+    </div>
+
+    <div id="editor" class="disabled">
+      <div class="row">
+        <span id="edTitle">未选择字幕</span>
+        <label>开始 <input id="edStart" class="tc" spellcheck="false"></label>
+        <label>结束 <input id="edEnd" class="tc" spellcheck="false"></label>
+        <span id="edMeta" class="meta"></span>
+      </div>
+      <div class="row">
+        <span id="edOriginal" class="orig"></span>
+        <button id="btnRevertCue" class="btn small hidden">恢复原始值</button>
+        <label class="chk"><input type="checkbox" id="edLock"> 锁定（不参与自动调整）</label>
+        <span class="spacer"></span>
+        <button id="btnPrevCue" class="btn small">← 上一条</button>
+        <button id="btnNextCue" class="btn small">下一条 →</button>
+      </div>
+      <textarea id="edText" rows="2" spellcheck="false"></textarea>
+    </div>
+  </div>
+
+  <div id="rightCol">
+    <div class="tabs">
+      <button id="tabIssues" class="tab active">异常 <span id="issueCount" class="badge">0</span></button>
+      <button id="tabCues" class="tab">字幕 <span id="cueCount" class="badge">0</span></button>
+      <span class="spacer"></span>
+      <span id="issueFilters" class="filters">
+        <button data-f="all" class="fbtn active">全部</button>
+        <button data-f="error" class="fbtn">错误</button>
+        <button data-f="warning" class="fbtn">提示</button>
+      </span>
+    </div>
+    <div id="issueList" class="list"></div>
+    <div id="cueList" class="list hidden"></div>
+  </div>
+</main>
+
+<footer id="timelineArea">
+  <div id="tlControls">
+    <button id="btnZoomOut" class="btn small">－</button>
+    <button id="btnZoomIn" class="btn small">＋</button>
+    <button id="btnFit" class="btn small">适配全部</button>
+    <label class="chk"><input type="checkbox" id="chkFollow" checked> 跟随播放</label>
+    <span id="tlInfo" class="meta"></span>
+  </div>
+  <canvas id="timeline"></canvas>
+</footer>
+
+<div id="toast" class="hidden"></div>
+
+<input type="file" id="fileSub" accept=".srt,.vtt,.txt" class="hidden">
+<input type="file" id="fileVideo" accept="video/*" class="hidden">
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
