@@ -5,6 +5,8 @@ const state = {
   cues: [],            // 当前工作副本
   original: [],        // 解析时的原始值（对照用）
   issues: [],
+  cutIssues: [],       // 切点校对结果（跨切 / 未对齐，含建议）
+  cuts: [],            // 切点（秒，升序），保存在浏览器本地
   settings: null,
   selectedId: null,
   undoStack: [],       // [{label, data}]
@@ -18,6 +20,7 @@ const state = {
 const FALLBACK_SETTINGS = {
   cpsMax: 20, minDuration: 1.0, maxDuration: 7.0, minGap: 0.08,
   maxCharsPerLine: 20, breakShortLine: 3, checkPunctuation: true,
+  cutTolerance: 0.12,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -90,7 +93,16 @@ async function api(path, body) {
 }
 
 /* ================= 撤销 / 重做 ================= */
-function snapshot() { return JSON.stringify(state.cues); }
+/* 快照同时覆盖字幕与切点，切点操作同样可撤销 */
+function snapshot() {
+  return JSON.stringify({ cues: state.cues, cuts: state.cuts });
+}
+
+function restoreSnapshot(data) {
+  const d = JSON.parse(data);
+  state.cues = d.cues;
+  state.cuts = (d.cuts || []).slice().sort((a, b) => a - b);
+}
 
 function pushUndo(label, data) {
   state.undoStack.push({ label, data: data ?? snapshot() });
@@ -103,7 +115,7 @@ function undo() {
   const item = state.undoStack.pop();
   if (!item) return;
   state.redoStack.push({ label: item.label, data: snapshot() });
-  state.cues = JSON.parse(item.data);
+  restoreSnapshot(item.data);
   afterHistoryChange(`已撤销：${item.label}`);
 }
 
@@ -111,13 +123,14 @@ function redo() {
   const item = state.redoStack.pop();
   if (!item) return;
   state.undoStack.push({ label: item.label, data: snapshot() });
-  state.cues = JSON.parse(item.data);
+  restoreSnapshot(item.data);
   afterHistoryChange(`已重做：${item.label}`);
 }
 
 function afterHistoryChange(msg) {
   if (state.selectedId && !cueById(state.selectedId)) state.selectedId = null;
   updateHistoryButtons();
+  saveCuts();
   scheduleValidate();
   renderAll();
   toast(msg, 2000);
@@ -144,12 +157,18 @@ function scheduleValidate() {
 }
 
 async function doValidate() {
-  if (!state.cues.length) { state.issues = []; renderAll(); return; }
+  if (!state.cues.length) {
+    state.issues = [];
+    state.cutIssues = [];
+    renderAll();
+    return;
+  }
   try {
     const res = await api("/api/validate", {
-      cues: state.cues, settings: state.settings,
+      cues: state.cues, settings: state.settings, cuts: state.cuts,
     });
     state.issues = res.issues;
+    state.cutIssues = res.cutIssues || [];
   } catch (e) {
     toast(e.message);
   }
@@ -171,6 +190,7 @@ function cueSeverityMap() {
 function renderAll() {
   renderStats();
   renderIssues();
+  renderCutIssues();
   renderCueList();
   renderEditor();
   requestDraw();
@@ -182,8 +202,15 @@ function renderStats() {
   const errs = state.issues.filter((i) => i.severity === "error").length;
   const warns = state.issues.filter((i) => i.severity === "warning").length;
   const mods = state.cues.filter(isModified).length;
-  el.innerHTML = `共 ${state.cues.length} 条 ｜ 错误 <b class="e">${errs}</b> ｜ ` +
-                 `提示 <b class="w">${warns}</b> ｜ 已修改 <b class="m">${mods}</b> 条`;
+  let html = `共 ${state.cues.length} 条 ｜ 错误 <b class="e">${errs}</b> ｜ ` +
+             `提示 <b class="w">${warns}</b> ｜ 已修改 <b class="m">${mods}</b> 条`;
+  if (state.cuts.length) {
+    const cross = state.cutIssues.filter((i) => i.type === "cross_cut").length;
+    const snap = state.cutIssues.length - cross;
+    html += ` ｜ 切点 ${state.cuts.length}（跨切 <b class="e">${cross}</b>` +
+            ` / 未对齐 <b class="w">${snap}</b>）`;
+  }
+  el.innerHTML = html;
 }
 
 function renderIssues() {
@@ -213,9 +240,176 @@ function renderIssues() {
   }
 }
 
+/* ================= 切点校对 ================= */
+const CUTS_KEY = "subtitleCutPoints.v1";
+
+function saveCuts() {
+  try {
+    localStorage.setItem(CUTS_KEY, JSON.stringify({
+      cuts: state.cuts,
+      tolerance: state.settings ? state.settings.cutTolerance : undefined,
+    }));
+  } catch { /* 隐私模式等场景下静默失败 */ }
+}
+
+function loadCuts() {
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(CUTS_KEY)); } catch { /* 忽略 */ }
+  if (!d) return;
+  if (Array.isArray(d.cuts)) {
+    state.cuts = [...new Set(d.cuts
+      .map((t) => Math.round(parseFloat(t) * 1000) / 1000)
+      .filter((t) => Number.isFinite(t) && t >= 0))]
+      .sort((a, b) => a - b);
+  }
+  if (Number.isFinite(d.tolerance) && state.settings)
+    state.settings.cutTolerance = Math.max(0, d.tolerance);
+}
+
+/* 以一次可撤销操作修改切点 */
+function mutateCuts(label, fn) {
+  pushUndo(label);
+  fn();
+  state.cuts.sort((a, b) => a - b);
+  saveCuts();
+  scheduleValidate();
+  renderAll();
+}
+
+function addCutAt(t) {
+  t = Math.max(0, Math.round(t * 1000) / 1000);
+  if (state.cuts.some((c) => Math.abs(c - t) < 0.0015)) {
+    toast(`切点 ${secToTc(t)} 已存在`);
+    return;
+  }
+  mutateCuts(`添加切点 ${secToTc(t)}`, () => { state.cuts.push(t); });
+  toast(`已添加切点 ${secToTc(t)}`, 2000);
+}
+
+function deleteCut(t) {
+  mutateCuts(`删除切点 ${secToTc(t)}`, () => {
+    state.cuts = state.cuts.filter((c) => Math.abs(c - t) > 0.0005);
+  });
+}
+
+function importCuts(text) {
+  const found = [], bad = [];
+  for (const part of text.split(/[\s,;，；]+/)) {
+    if (!part) continue;
+    const v = parseTc(part);
+    if (v === null || v < 0) { bad.push(part); continue; }
+    found.push(Math.round(v * 1000) / 1000);
+  }
+  const fresh = [...new Set(found)].filter(
+    (t) => !state.cuts.some((c) => Math.abs(c - t) < 0.0015));
+  if (fresh.length)
+    mutateCuts(`导入 ${fresh.length} 个切点`, () => { state.cuts.push(...fresh); });
+  let msg = `导入 ${fresh.length} 个切点`;
+  if (found.length - fresh.length > 0)
+    msg += `，${found.length - fresh.length} 个重复已跳过`;
+  if (bad.length) msg += `，${bad.length} 处无法识别（${bad.slice(0, 3).join("、")}…）`;
+  toast(msg, 6000);
+}
+
+/* 点击建议：选中字幕并把视频定位到切点处 */
+function jumpToCutIssue(iss) {
+  state.selectedId = iss.cues[0];
+  const c = cueById(iss.cues[0]);
+  if (state.hasVideo) player.currentTime = Math.max(0, iss.cut - 0.04);
+  if (c) ensureVisible(Math.min(c.start, iss.cut) - 0.5,
+                       Math.max(c.end, iss.cut) + 0.5);
+  renderAll();
+  const row = document.querySelector(`.cue[data-cid="${iss.cues[0]}"]`);
+  if (row) row.scrollIntoView({ block: "nearest" });
+}
+
+/* 应用切点建议：targets 为 null 时批量应用全部 */
+async function applyCutTargets(targets, label) {
+  if (!state.cues.length) return;
+  try {
+    const body = { cues: state.cues, cuts: state.cuts, settings: state.settings };
+    if (targets) body.targets = targets;
+    const res = await api("/api/cuts/apply", body);
+    pushUndo(label);
+    state.cues = res.cues;
+    state.issues = res.issues;
+    state.cutIssues = res.cutIssues || [];
+    renderAll();
+    const skipped = res.changes.filter((c) => c.status === "skipped");
+    let msg = `${label}：应用 ${res.stats.applied} 处`;
+    if (skipped.length) {
+      msg += `，${skipped.length} 处冲突保留原值\n` +
+        skipped.slice(0, 8).map((c) => `· #${c.cue} ${c.reason}`).join("\n");
+      if (skipped.length > 8) msg += `\n… 共 ${skipped.length} 处`;
+    }
+    toast(msg, skipped.length ? 8000 : 3000);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function fmtPairs(pairs) {
+  return pairs.map((p) => `${secToTc(p[0])}→${secToTc(p[1])}`).join(" ＋ ");
+}
+
+function renderCutIssues() {
+  $("cutCount").textContent = state.cutIssues.length;
+  const cross = state.cutIssues.filter((i) => i.type === "cross_cut").length;
+  const snap = state.cutIssues.length - cross;
+  $("cutStats").textContent = state.cuts.length
+    ? `切点 ${state.cuts.length} 个 ｜ 跨切 ${cross} ｜ 未对齐 ${snap}`
+    : "尚未设置切点";
+  $("btnApplyAllCuts").disabled =
+    !state.cutIssues.length || !state.cues.length;
+  $("btnClearCuts").disabled = !state.cuts.length;
+
+  const list = $("cutList");
+  list.innerHTML = "";
+  if (!state.cuts.length) {
+    list.innerHTML = `<div class="empty-tip">还没有切点：播放视频时按 C 或点“✂ 当前帧切点”添加，<br>` +
+      `也可以在“切点校对”面板批量导入秒数 / 时间码</div>`;
+    return;
+  }
+  if (!state.cues.length) {
+    list.innerHTML = `<div class="empty-tip">已记录 ${state.cuts.length} 个切点，载入字幕后开始校对</div>`;
+    return;
+  }
+  if (!state.cutIssues.length) {
+    list.innerHTML = `<div class="empty-tip">所有字幕均已避开或对齐 ${state.cuts.length} 个切点 🎉</div>`;
+    return;
+  }
+  for (const iss of state.cutIssues) {
+    const sug = iss.suggestion;
+    const div = document.createElement("div");
+    div.className = `issue ${iss.severity}`;
+    div.innerHTML =
+      `<div class="head"><span class="sev">${iss.severity === "error" ? "⛔ 错误" : "⚠️ 提示"}</span>` +
+      `<span class="typ">[${iss.label}]</span>` +
+      `<span class="refs">#${iss.cues[0]} ✂${secToTc(iss.cut)}</span></div>` +
+      `<div class="msg"></div>` +
+      `<div class="preview"><span class="pv-label">调整前</span> ${fmtPairs(sug.before)}\n` +
+      `<span class="pv-label">调整后</span> ${fmtPairs(sug.after)}</div>` +
+      (sug.feasible
+        ? ""
+        : `<div class="detail bad">冲突：${sug.reason}（应用时将保留原值）</div>`) +
+      `<div class="actions"><button class="btn small primary" ` +
+      `${sug.feasible ? "" : "disabled"}>应用此建议</button></div>`;
+    div.querySelector(".msg").textContent = iss.message;
+    div.onclick = (e) => {
+      if (e.target.tagName !== "BUTTON") jumpToCutIssue(iss);
+    };
+    div.querySelector("button").onclick = (e) => {
+      e.stopPropagation();
+      applyCutTargets(
+        [{ cue: sug.cue, action: sug.action, cut: sug.cut }],
+        `应用切点建议 #${sug.cue}`);
+    };
+    list.appendChild(div);
+  }
+}
+
 function renderCueList() {
-  $("cueCount").textContent = state.cues.length;
-  const list = $("cueList");
+  $("cueCount").textContent = state.cues.length;  const list = $("cueList");
   list.innerHTML = "";
   if (!state.cues.length) return;
   const sevMap = cueSeverityMap();
@@ -352,6 +546,7 @@ $("fileVideo").onchange = (e) => {
   player.src = URL.createObjectURL(f);
   state.hasVideo = true;
   $("noVideo").classList.add("hidden");
+  $("btnAddCut").disabled = false;
   e.target.value = "";
   requestDraw();
 };
@@ -464,7 +659,8 @@ $("btnExportSrt").onclick = () =>
 $("btnExportVtt").onclick = () =>
   download("/api/export", { cues: state.cues, format: "vtt" }, "corrected.vtt");
 $("btnSummary").onclick = () =>
-  download("/api/summary", { cues: state.cues, settings: state.settings },
+  download("/api/summary",
+           { cues: state.cues, settings: state.settings, cuts: state.cuts },
            "subtitle_issues.md");
 
 /* ================= 设置 ================= */
@@ -482,6 +678,8 @@ function readSettingsFromUI() {
     maxCharsPerLine: num("setMaxChars", FALLBACK_SETTINGS.maxCharsPerLine),
     breakShortLine: num("setBreakShort", FALLBACK_SETTINGS.breakShortLine),
     checkPunctuation: $("setPunct").checked,
+    // 容差由切点面板维护，这里保留当前值
+    cutTolerance: state.settings?.cutTolerance ?? FALLBACK_SETTINGS.cutTolerance,
   };
   scheduleValidate();
 }
@@ -494,27 +692,68 @@ function fillSettingsUI(s) {
   $("setMaxChars").value = s.maxCharsPerLine;
   $("setBreakShort").value = s.breakShortLine;
   $("setPunct").checked = !!s.checkPunctuation;
+  $("cutTol").value = s.cutTolerance;
 }
 
 for (const id of ["setCps", "setMinDur", "setMaxDur", "setMinGap",
                   "setMaxChars", "setBreakShort", "setPunct"])
   $(id).addEventListener("change", readSettingsFromUI);
 
+/* ================= 切点面板 ================= */
+$("btnCuts").onclick = () => $("cutPanel").classList.toggle("hidden");
+
+$("btnAddCut").onclick = () => {
+  if (state.hasVideo) addCutAt(player.currentTime);
+};
+
+$("btnImportCuts").onclick = () =>
+  $("cutImportBox").classList.toggle("hidden");
+$("btnCancelImportCuts").onclick = () =>
+  $("cutImportBox").classList.add("hidden");
+$("btnDoImportCuts").onclick = () => {
+  const text = $("cutImportArea").value;
+  if (!text.trim()) return;
+  $("cutImportBox").classList.add("hidden");
+  $("cutImportArea").value = "";
+  importCuts(text);
+};
+
+$("btnClearCuts").onclick = () => {
+  if (!state.cuts.length) return;
+  if (!confirm(`清空全部 ${state.cuts.length} 个切点？（可撤销）`)) return;
+  mutateCuts("清空切点", () => { state.cuts = []; });
+};
+
+$("cutTol").addEventListener("change", () => {
+  const v = parseFloat($("cutTol").value);
+  state.settings.cutTolerance =
+    Number.isFinite(v) ? Math.max(0, v) : FALLBACK_SETTINGS.cutTolerance;
+  $("cutTol").value = state.settings.cutTolerance;
+  saveCuts();
+  scheduleValidate();
+});
+
+$("btnApplyAllCuts").onclick = () =>
+  applyCutTargets(null, "批量应用切点建议");
+
 /* ================= 标签页与过滤 ================= */
-$("tabIssues").onclick = () => {
-  state.tab = "issues";
-  $("tabIssues").classList.add("active");
-  $("tabCues").classList.remove("active");
-  $("issueList").classList.remove("hidden");
-  $("cueList").classList.add("hidden");
-};
-$("tabCues").onclick = () => {
-  state.tab = "cues";
-  $("tabCues").classList.add("active");
-  $("tabIssues").classList.remove("active");
-  $("cueList").classList.remove("hidden");
-  $("issueList").classList.add("hidden");
-};
+const TABS = [
+  ["issues", "tabIssues", "issueList"],
+  ["cuts", "tabCuts", "cutList"],
+  ["cues", "tabCues", "cueList"],
+];
+
+function switchTab(name) {
+  state.tab = name;
+  for (const [n, btnId, listId] of TABS) {
+    $(btnId).classList.toggle("active", n === name);
+    $(listId).classList.toggle("hidden", n !== name);
+  }
+}
+
+$("tabIssues").onclick = () => switchTab("issues");
+$("tabCuts").onclick = () => switchTab("cuts");
+$("tabCues").onclick = () => switchTab("cues");
 document.querySelectorAll("#issueFilters .fbtn").forEach((btn) => {
   btn.onclick = () => {
     state.filter = btn.dataset.f;
@@ -527,6 +766,7 @@ document.querySelectorAll("#issueFilters .fbtn").forEach((btn) => {
 /* ================= 时间轴 ================= */
 let cueRects = [];   // [{c, x, y, w, h}]
 let markers = [];    // [{x, issue}]
+let cutLines = [];   // [{x, t}] 视口内的切点线
 let drawQueued = false;
 
 function requestDraw() {
@@ -551,7 +791,7 @@ function ensureVisible(start, end) {
 }
 
 function fitTimeline() {
-  const end = Math.max(1, ...state.cues.map((c) => c.end));
+  const end = Math.max(1, ...state.cues.map((c) => c.end), ...state.cuts);
   state.view.pxPerSec = Math.max(2, (canvas.clientWidth - 20) / (end * 1.05));
   state.view.offsetSec = 0;
   requestDraw();
@@ -597,7 +837,9 @@ function drawTimeline() {
 
   cueRects = [];
   markers = [];
+  cutLines = [];
   if (!state.cues.length) {
+    drawCuts(W, H);
     ctx.fillStyle = "#8b96a5";
     ctx.font = "13px sans-serif";
     ctx.fillText("载入字幕后，这里会显示可缩放的字幕时间轴", 16, LANE_Y + 30);
@@ -667,12 +909,36 @@ function drawTimeline() {
     ctx.fill();
   }
 
+  drawCuts(W, H);
   drawPlayhead();
 
   // 视图信息
   $("tlInfo").textContent =
     `${secToTc(offsetSec)} — ${secToTc(offsetSec + viewSpan())} ｜ ` +
     `${Math.round(pxPerSec)} px/s`;
+}
+
+/* 切点线：贯穿整个时间轴的紫色虚线 + 顶部小旗，任何缩放级别都可见 */
+function drawCuts(W, H) {
+  for (const t of state.cuts) {
+    const x = secToX(t);
+    if (x < -2 || x > W + 2) continue;
+    cutLines.push({ x, t });
+    ctx.strokeStyle = "rgba(192,132,252,0.85)";
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#c084fc";
+    ctx.beginPath();
+    ctx.moveTo(x, RULER_H + 1);
+    ctx.lineTo(x - 5, RULER_H + 8);
+    ctx.lineTo(x + 5, RULER_H + 8);
+    ctx.closePath();
+    ctx.fill();
+  }
 }
 
 function drawPlayhead() {
@@ -713,12 +979,21 @@ function hitCue(x, y) {
 }
 
 canvas.addEventListener("mousedown", (e) => {
-  if (!state.cues.length) return;
+  if (!state.cues.length && !state.cuts.length) return;
   const { x, y } = canvasPos(e);
 
   if (y <= RULER_H) {                       // 标尺：拖动定位播放头
     drag = { mode: "scrub", moved: false };
     scrubTo(x);
+    return;
+  }
+  // 切点线优先于字幕块命中（线很细，给 4px 宽容度）
+  const cutHit = cutLines.find((cl) => Math.abs(cl.x - x) <= 4);
+  if (cutHit) {
+    drag = {
+      mode: "cut", t: cutHit.t, startX: x, origT: cutHit.t,
+      snapshot: snapshot(), moved: false,
+    };
     return;
   }
   if (y <= LANE_Y) {                        // 异常标记：点击跳转
@@ -756,6 +1031,15 @@ window.addEventListener("mousemove", (e) => {
     requestDraw();
     return;
   }
+  if (drag.mode === "cut") {
+    const dt = (x - drag.startX) / pps;
+    if (Math.abs(dt) > 0.0005) drag.moved = true;
+    const nt = Math.max(0, Math.round((drag.origT + dt) * 1000) / 1000);
+    const idx = state.cuts.findIndex((c) => Math.abs(c - drag.t) < 0.0005);
+    if (idx >= 0) { state.cuts[idx] = nt; drag.t = nt; }
+    requestDraw();
+    return;
+  }
   const dt = (x - drag.startX) / pps;
   const c = drag.cue;
   if (Math.abs(dt) > 0.0005) drag.moved = true;
@@ -778,6 +1062,26 @@ window.addEventListener("mouseup", () => {
   if (!drag) return;
   const d = drag;
   drag = null;
+  if (d.mode === "cut") {
+    if (!d.moved) return;
+    state.cuts.sort((a, b) => a - b);
+    // 拖到已有切点附近（1.5ms 内）视为重复，放弃本次移动
+    const dup = state.cuts.some(
+      (c, i, arr) => i > 0 && Math.abs(c - arr[i - 1]) < 0.0015);
+    if (dup) {
+      state.cuts = JSON.parse(d.snapshot).cuts;
+      toast("目标位置已有切点，未移动", 2500);
+    } else {
+      state.undoStack.push({ label: `拖动切点到 ${secToTc(d.t)}`, data: d.snapshot });
+      if (state.undoStack.length > 100) state.undoStack.shift();
+      state.redoStack = [];
+      updateHistoryButtons();
+      saveCuts();
+      scheduleValidate();
+    }
+    renderAll();
+    return;
+  }
   if ((d.mode === "move" || d.mode === "left" || d.mode === "right")) {
     if (d.moved) {
       state.undoStack.push({ label: `拖动 #${d.cue.id} 时间轴`, data: d.snapshot });
@@ -800,7 +1104,7 @@ function scrubTo(x) {
 }
 
 canvas.addEventListener("wheel", (e) => {
-  if (!state.cues.length) return;
+  if (!state.cues.length && !state.cuts.length) return;
   e.preventDefault();
   const { x } = canvasPos(e);
   const t = xToSec(x);
@@ -810,9 +1114,24 @@ canvas.addEventListener("wheel", (e) => {
   requestDraw();
 }, { passive: false });
 
+/* 右键点击切点线：删除该切点 */
+canvas.addEventListener("contextmenu", (e) => {
+  const { x, y } = canvasPos(e);
+  if (y <= RULER_H) return;
+  const cutHit = cutLines.find((cl) => Math.abs(cl.x - x) <= 4);
+  if (cutHit) {
+    e.preventDefault();
+    deleteCut(cutHit.t);
+  }
+});
+
 canvas.addEventListener("mousemove", (e) => {
   if (drag) { canvas.style.cursor = "grabbing"; return; }
   const { x, y } = canvasPos(e);
+  if (y > RULER_H && cutLines.some((cl) => Math.abs(cl.x - x) <= 4)) {
+    canvas.style.cursor = "ew-resize";
+    return;
+  }
   const hit = y > LANE_Y && hitCue(x, y);
   canvas.style.cursor =
     !hit ? "crosshair" :
@@ -878,6 +1197,9 @@ window.addEventListener("keydown", (e) => {
   } else if (e.key === " " && !typing && state.hasVideo) {
     e.preventDefault();
     player.paused ? player.play() : player.pause();
+  } else if (e.key.toLowerCase() === "c" && !typing && state.hasVideo &&
+             !e.ctrlKey && !e.metaKey && !e.altKey) {
+    addCutAt(player.currentTime);
   }
 });
 
@@ -889,6 +1211,7 @@ window.addEventListener("keydown", (e) => {
   } catch {
     state.settings = { ...FALLBACK_SETTINGS };
   }
+  loadCuts();          // 恢复浏览器本地保存的切点与容差
   fillSettingsUI(state.settings);
   resizeCanvas();
   renderAll();

@@ -1,6 +1,6 @@
 """字幕节奏校对 Web 应用 —— Flask 后端。
 
-职责：解析、校验、批量修复、导出 SRT/VTT 与问题摘要。
+职责：解析、校验、批量修复、切点校对、导出 SRT/VTT 与问题摘要。
 视频与字幕文件均在浏览器本地读取，服务器只处理文本。
 """
 
@@ -57,13 +57,43 @@ def api_parse():
 def api_validate():
     data = _json()
     cues = data.get("cues") or []
-    issues = core.validate(cues, data.get("settings"))
+    settings = data.get("settings")
+    issues = core.validate(cues, settings)
+    cut_issues = core.check_cuts(cues, data.get("cuts"), settings)
     return jsonify({
         "issues": issues,
+        "cutIssues": cut_issues,
         "stats": {
             "cues": len(cues),
             "errors": sum(1 for i in issues if i["severity"] == "error"),
             "warnings": sum(1 for i in issues if i["severity"] == "warning"),
+            "cutErrors": sum(1 for i in cut_issues
+                             if i["severity"] == "error"),
+            "cutWarnings": sum(1 for i in cut_issues
+                               if i["severity"] == "warning"),
+        },
+    })
+
+
+@app.post("/api/cuts/apply")
+def api_cuts_apply():
+    """应用切点建议：targets 缺省时批量应用全部，否则只应用指定项。"""
+    data = _json()
+    cues = data.get("cues") or []
+    settings = data.get("settings")
+    cuts = data.get("cuts") or []
+    new_cues, changes = core.apply_cut_suggestions(
+        cues, cuts, settings, data.get("targets"))
+    issues = core.validate(new_cues, settings)
+    cut_issues = core.check_cuts(new_cues, cuts, settings)
+    return jsonify({
+        "cues": new_cues,
+        "changes": changes,
+        "issues": issues,
+        "cutIssues": cut_issues,
+        "stats": {
+            "applied": sum(1 for c in changes if c["status"] == "applied"),
+            "skipped": sum(1 for c in changes if c["status"] == "skipped"),
         },
     })
 
@@ -100,9 +130,13 @@ def api_summary():
     data = _json()
     cues = data.get("cues") or []
     settings = data.get("settings")
+    cuts = data.get("cuts")
     issues = core.validate(cues, settings)
-    return _attachment(core.build_summary(cues, issues, settings),
-                       "subtitle_issues.md")
+    cut_issues = core.check_cuts(cues, cuts, settings)
+    return _attachment(
+        core.build_summary(cues, issues, settings,
+                           cut_issues=cut_issues, cuts=cuts),
+        "subtitle_issues.md")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ DEFAULT_SETTINGS = {
     "maxCharsPerLine": 20,    # 单行最大字数
     "breakShortLine": 3,      # 断句短行阈值：行字数 <= 该值视为碎行
     "checkPunctuation": True, # 是否启用标点断句检查
+    "cutTolerance": 0.12,     # 切点吸附容差（秒）：首尾距切点在该范围内视为未对齐
 }
 
 TYPE_LABELS = {
@@ -43,6 +44,8 @@ TYPE_LABELS = {
     "line_length": "单行过长",
     "line_break": "断句不当",
     "order": "时间倒置",
+    "cross_cut": "跨切字幕",
+    "cut_snap": "切点未对齐",
 }
 
 _TIMING_RE = re.compile(
@@ -171,6 +174,7 @@ def merge_settings(settings: dict | None) -> dict:
     for key in ("cpsMax", "minDuration", "maxDuration"):
         merged[key] = max(0.01, float(merged[key]))
     merged["minGap"] = max(0.0, float(merged["minGap"]))
+    merged["cutTolerance"] = max(0.0, float(merged["cutTolerance"]))
     merged["maxCharsPerLine"] = max(1, int(merged["maxCharsPerLine"]))
     merged["breakShortLine"] = max(1, int(merged["breakShortLine"]))
     merged["checkPunctuation"] = bool(merged["checkPunctuation"])
@@ -531,6 +535,350 @@ def batch_fix(cues: list[dict], settings: dict | None = None):
     return ordered, changes
 
 
+# ---------------------------------------------------------------- 切点校对
+
+def _coerce_cuts(cuts) -> list[float]:
+    """整理成升序、去重、非负的切点秒数列表。"""
+    out = set()
+    for t in cuts or []:
+        try:
+            v = round(float(t), 3)
+        except (TypeError, ValueError):
+            continue
+        if v >= 0:
+            out.add(v)
+    return sorted(out)
+
+
+def _snap_start_ok(cue: dict, t: float, prev: dict | None,
+                   min_gap: float) -> tuple[bool, str]:
+    """片头吸附到 t 的约束检查：有效时长 + 与前一条的最小间隔。"""
+    if t < -EPS:
+        return False, "切点时间小于 0"
+    if cue["end"] - t < MIN_CUE_DUR - EPS:
+        return False, f"吸附后时长不足最短有效时长 {MIN_CUE_DUR:.2f}s"
+    if prev is not None and prev["end"] + min_gap > t + EPS:
+        return False, f"吸附后与第 {prev['id']} 条间隔不足 {min_gap:.2f}s"
+    return True, ""
+
+
+def _snap_end_ok(cue: dict, t: float, nxt: dict | None,
+                 min_gap: float) -> tuple[bool, str]:
+    """片尾吸附到 t 的约束检查：有效时长 + 与后一条的最小间隔。"""
+    if t - cue["start"] < MIN_CUE_DUR - EPS:
+        return False, f"吸附后时长不足最短有效时长 {MIN_CUE_DUR:.2f}s"
+    if nxt is not None and nxt["start"] - min_gap < t - EPS:
+        return False, f"吸附后与第 {nxt['id']} 条间隔不足 {min_gap:.2f}s"
+    return True, ""
+
+
+def _split_ok(cue: dict, t: float, min_gap: float) -> tuple[bool, str]:
+    """切点处拆分的约束检查：两半都至少保留最短有效时长。"""
+    half = min_gap / 2
+    if t - half - cue["start"] < MIN_CUE_DUR - EPS or \
+            cue["end"] - (t + half) < MIN_CUE_DUR - EPS:
+        return False, (f"切点距片头/片尾过近，拆分后片段不足最短有效时长 "
+                       f"{MIN_CUE_DUR:.2f}s")
+    return True, ""
+
+
+def check_cuts(cues: list[dict], cuts,
+               settings: dict | None = None) -> list[dict]:
+    """切点校对：找出跨切字幕，以及首尾距切点一个容差内却未对齐的字幕。
+
+    每条问题附带 suggestion：跨切 → 拆分建议；未对齐 → 吸附建议。
+    suggestion.feasible 是约束预检（锁定/最小间隔/有效时长），冲突时
+    应用会保留原值并在改动记录中写明原因。
+    """
+    st = merge_settings(settings)
+    cut_list = _coerce_cuts(cuts)
+    if not cut_list:
+        return []
+    tol = st["cutTolerance"]
+    half = st["minGap"] / 2
+    ordered = sorted(cues, key=lambda c: (c["start"], c["id"]))
+
+    issues: list[dict] = []
+
+    def add(itype, severity, cue, t, edge, message, detail, suggestion):
+        issues.append({
+            "id": f"cut{len(issues) + 1}",
+            "type": itype,
+            "label": TYPE_LABELS[itype],
+            "severity": severity,
+            "cues": [cue["id"]],
+            "cut": t,
+            "edge": edge,
+            "message": message,
+            "detail": detail,
+            "suggestion": suggestion,
+        })
+
+    for i, c in enumerate(ordered):
+        if c["end"] - c["start"] <= EPS:
+            continue  # 时间倒置的条目不参与切点判定
+        prev = ordered[i - 1] if i > 0 else None
+        nxt = ordered[i + 1] if i + 1 < len(ordered) else None
+        s, e = c["start"], c["end"]
+        # 已与任一切点对齐的边界不再给吸附建议：切点间距可能小于容差，
+        # 对齐到其中一个后不应再被另一个拉走（保证批量应用幂等）
+        aligned_start = any(abs(t - s) <= EPS for t in cut_list)
+        aligned_end = any(abs(t - e) <= EPS for t in cut_list)
+        win = [t for t in cut_list if s - tol - EPS <= t <= e + tol + EPS]
+        # 每端只吸附到最近的切点
+        snap_start_cut = None if aligned_start else min(
+            (t for t in win if EPS < abs(t - s) <= tol + EPS),
+            key=lambda t: abs(t - s), default=None)
+        snap_end_cut = None if aligned_end else min(
+            (t for t in win if EPS < abs(t - e) <= tol + EPS),
+            key=lambda t: abs(t - e), default=None)
+        for t in win:
+            d_start = t - s
+            d_end = e - t
+            if t == snap_start_cut and \
+                    (t != snap_end_cut or abs(d_start) <= abs(d_end)):
+                ok, reason = _snap_start_ok(c, t, prev, st["minGap"])
+                if not ok and prev is not None and \
+                        prev["end"] + st["minGap"] > t + EPS and \
+                        abs(prev["end"] - t) <= tol + EPS:
+                    # 相邻对已在容差内夹住切点（如前一条终于切点、或已按
+                    # ±半个最小间隔拆好），吸附必然被邻居挡住且无可达成的
+                    # 改进，不重复报
+                    continue
+                if c.get("locked"):
+                    ok, reason = False, "字幕已锁定"
+                add("cut_snap", "warning", c, t, "start",
+                    f"片头距切点 {fmt_srt(t)} 仅 {abs(d_start) * 1000:.0f}ms，未对齐",
+                    "建议把片头吸附到切点，避免字幕出现与画面切换错位",
+                    {"action": "snap_start", "cue": c["id"], "cut": t,
+                     "before": [[s, e]],
+                     "after": [[t, e]],
+                     "feasible": ok, "reason": reason})
+            elif t == snap_end_cut:
+                ok, reason = _snap_end_ok(c, t, nxt, st["minGap"])
+                if not ok and nxt is not None and \
+                        nxt["start"] - st["minGap"] < t - EPS and \
+                        abs(nxt["start"] - t) <= tol + EPS:
+                    continue  # 同上：相邻对已夹住切点
+                if c.get("locked"):
+                    ok, reason = False, "字幕已锁定"
+                add("cut_snap", "warning", c, t, "end",
+                    f"片尾距切点 {fmt_srt(t)} 仅 {abs(d_end) * 1000:.0f}ms，未对齐",
+                    "建议把片尾吸附到切点，避免画面切换后字幕残留",
+                    {"action": "snap_end", "cue": c["id"], "cut": t,
+                     "before": [[s, e]],
+                     "after": [[s, t]],
+                     "feasible": ok, "reason": reason})
+            elif d_start > tol + EPS and d_end > tol + EPS:
+                ok, reason = _split_ok(c, t, st["minGap"])
+                if c.get("locked"):
+                    ok, reason = False, "字幕已锁定"
+                add("cross_cut", "error", c, t, None,
+                    f"字幕横跨切点 {fmt_srt(t)}（切点位于片内 {d_start:.2f}s 处）",
+                    "画面已切换但字幕未更换，建议在切点处拆分",
+                    {"action": "split", "cue": c["id"], "cut": t,
+                     "before": [[s, e]],
+                     "after": [[s, _r3(t - half)],
+                               [_r3(t + half), e]],
+                     "feasible": ok, "reason": reason})
+    return issues
+
+
+def _visible_char_indices(text: str) -> list[int]:
+    """可见字符在原文中的索引（跳过 HTML/ASS 标签与空白）。"""
+    idxs = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "<":
+            j = text.find(">", i + 1)
+            if j != -1:
+                i = j + 1
+                continue
+        elif ch == "{":
+            j = text.find("}", i + 1)
+            if j != -1:
+                i = j + 1
+                continue
+        if not ch.isspace():
+            idxs.append(i)
+        i += 1
+    return idxs
+
+
+def split_text(text: str, ratio: float) -> tuple[str, str]:
+    """按时间比例把字幕文本拆成两段（供切点拆分使用）。
+
+    优先落在附近的换行处，其次落在断句标点之后，否则按可见字符比例
+    直切；可见字符不足两个时无法拆分，两段均保留原文。
+    """
+    idxs = _visible_char_indices(text)
+    total = len(idxs)
+    if total <= 1:
+        return text, text
+    target = min(total - 1, max(1, round(total * ratio)))
+    cut = idxs[target]  # 在第 target+1 个可见字符之前断开
+    window = max(3, total // 3)
+    best = None  # (距离, 优先级, 位置)，换行优先于标点
+    for j, ch in enumerate(text):
+        if ch == "\n":
+            cand = (abs(j - cut), 0, j)
+        elif j > 0 and text[j - 1] in BREAK_OK_CHARS:
+            cand = (abs(j - cut), 1, j)
+        else:
+            continue
+        if cand[0] > window:
+            continue
+        # 断点后两段都必须还有可见字符
+        if not any(i < cand[2] for i in idxs) or \
+                not any(i >= cand[2] for i in idxs):
+            continue
+        if best is None or cand < best:
+            best = cand
+    if best is not None:
+        cut = best[2]
+    return text[:cut].strip("\n"), text[cut:].strip("\n")
+
+
+def _apply_cut_suggestion(work: list[dict], sugg: dict,
+                          st: dict) -> tuple[bool, dict]:
+    """尝试应用单条切点建议；返回 (是否应用, 改动记录)。
+
+    冲突（锁定/最小间隔/有效时长/建议过期）时不修改 work，记录保留原值
+    及原因。
+    """
+    cue = next((c for c in work if c["id"] == sugg["cue"]), None)
+    base = {"cue": sugg["cue"], "action": sugg["action"], "cut": sugg["cut"]}
+    if cue is None:
+        return False, {**base, "status": "skipped", "before": None,
+                       "after": None, "reason": "字幕已不存在，未改动"}
+    before = [[cue["start"], cue["end"]]]
+    t = sugg["cut"]
+    g = st["minGap"]
+
+    def skip(reason):
+        return False, {**base, "status": "skipped", "before": before,
+                       "after": before, "reason": reason}
+
+    if cue.get("locked"):
+        return skip("字幕已锁定，保留原值")
+
+    ordered = sorted(work, key=lambda c: (c["start"], c["id"]))
+    idx = ordered.index(cue)
+    prev = ordered[idx - 1] if idx > 0 else None
+    nxt = ordered[idx + 1] if idx + 1 < len(ordered) else None
+    action = sugg["action"]
+
+    if action == "snap_start":
+        if abs(cue["start"] - t) <= EPS:
+            return skip("片头已与切点对齐")
+        ok, reason = _snap_start_ok(cue, t, prev, g)
+        if not ok:
+            return skip(reason + "，保留原值")
+        cue["start"] = _r3(t)
+        return True, {**base, "status": "applied", "before": before,
+                      "after": [[cue["start"], cue["end"]]],
+                      "reason": f"片头吸附到切点 {fmt_srt(t)}"}
+
+    if action == "snap_end":
+        if abs(cue["end"] - t) <= EPS:
+            return skip("片尾已与切点对齐")
+        ok, reason = _snap_end_ok(cue, t, nxt, g)
+        if not ok:
+            return skip(reason + "，保留原值")
+        cue["end"] = _r3(t)
+        return True, {**base, "status": "applied", "before": before,
+                      "after": [[cue["start"], cue["end"]]],
+                      "reason": f"片尾吸附到切点 {fmt_srt(t)}"}
+
+    # split：在切点处拆分，两半之间留出最小间隔
+    if not (cue["start"] + EPS < t < cue["end"] - EPS):
+        return skip("切点已不在字幕范围内，未拆分")
+    ok, reason = _split_ok(cue, t, g)
+    if not ok:
+        return skip(reason + "，保留原值")
+    half = g / 2
+    lo, hi = _r3(t - half), _r3(t + half)
+    ratio = (t - cue["start"]) / (cue["end"] - cue["start"])
+    text_a, text_b = split_text(cue["text"], ratio)
+    new_id = max(c["id"] for c in work) + 1
+    end0 = cue["end"]
+    note = ""
+    if cue["text"].strip() and text_a == cue["text"] and text_b == cue["text"]:
+        note = "；文本过短无法拆分，两段均保留原文，请手动调整"
+    cue["end"] = lo
+    cue["text"] = text_a
+    work.append({"id": new_id, "start": hi, "end": end0,
+                 "text": text_b, "locked": False})
+    return True, {**base, "status": "applied", "before": before,
+                  "after": [[cue["start"], lo], [hi, end0]],
+                  "reason": f"在切点 {fmt_srt(t)} 处拆分（新字幕 #{new_id}）{note}"}
+
+
+def apply_cut_suggestions(cues: list[dict], cuts,
+                          settings: dict | None = None,
+                          targets: list[dict] | None = None):
+    """应用切点建议（拆分/吸附）。
+
+    targets 为 None 时批量应用当前全部建议；否则只应用指定项（每项
+    {"cue": id, "action": "split"|"snap_start"|"snap_end", "cut": 秒}）。
+    返回 (new_cues, changes)；冲突项保留原值并在 changes 中写明原因。
+    """
+    st = merge_settings(settings)
+    work = copy.deepcopy(cues)
+    changes: list[dict] = []
+
+    def suggestions_now():
+        return [iss["suggestion"] for iss in check_cuts(work, cuts, st)]
+
+    if targets is None:
+        # 批量：每应用一条就重算建议（几何已变化）；同一字幕的同一端只
+        # 吸附一次，避免相邻两个切点之间来回吸附；一轮全部不可应用时
+        # 记录冲突原因后结束
+        done_edges: set[tuple[str, int]] = set()
+        cap = 4 * (len(work) + len(_coerce_cuts(cuts))) + 50
+        for _ in range(cap):
+            todo = [s for s in suggestions_now()
+                    if not (s["action"] in ("snap_start", "snap_end") and
+                            (s["action"], s["cue"]) in done_edges)]
+            if not todo:
+                break
+            progress = False
+            for s in todo:
+                ok, rec = _apply_cut_suggestion(work, s, st)
+                if ok:
+                    changes.append(rec)
+                    if s["action"] in ("snap_start", "snap_end"):
+                        done_edges.add((s["action"], s["cue"]))
+                    progress = True
+                    break
+            if not progress:
+                for s in todo:
+                    _, rec = _apply_cut_suggestion(work, s, st)
+                    changes.append(rec)
+                break
+    else:
+        for t in targets:
+            sugg = next(
+                (s for s in suggestions_now()
+                 if s["cue"] == t.get("cue") and s["action"] == t.get("action")
+                 and abs(s["cut"] - float(t.get("cut", -1))) < 0.002),
+                None)
+            if sugg is None:
+                changes.append({
+                    "cue": t.get("cue"), "action": t.get("action"),
+                    "cut": t.get("cut"), "status": "skipped",
+                    "before": None, "after": None,
+                    "reason": "建议已过期（字幕或切点已变化），未改动",
+                })
+                continue
+            _, rec = _apply_cut_suggestion(work, sugg, st)
+            changes.append(rec)
+
+    work.sort(key=lambda c: (c["start"], c["id"]))
+    return work, changes
+
+
 # ---------------------------------------------------------------- 导出
 
 def export_srt(cues: list[dict]) -> str:
@@ -550,12 +898,15 @@ def export_vtt(cues: list[dict]) -> str:
 
 
 def build_summary(cues: list[dict], issues: list[dict],
-                  settings: dict | None = None) -> str:
-    """生成问题摘要（Markdown）。"""
+                  settings: dict | None = None,
+                  cut_issues: list[dict] | None = None,
+                  cuts=None) -> str:
+    """生成问题摘要（Markdown），含切点校对结果。"""
     st = merge_settings(settings)
     by_id = {c["id"]: c for c in cues}
-    errors = [i for i in issues if i["severity"] == "error"]
-    warnings = [i for i in issues if i["severity"] == "warning"]
+    all_issues = list(issues) + list(cut_issues or [])
+    errors = [i for i in all_issues if i["severity"] == "error"]
+    warnings = [i for i in all_issues if i["severity"] == "warning"]
 
     lines = [
         "# 字幕节奏校对问题摘要",
@@ -571,6 +922,7 @@ def build_summary(cues: list[dict], issues: list[dict],
         f"- 最小间隔：{st['minGap']:g}s ｜ 单行字数：{st['maxCharsPerLine']} 字",
         f"- 断句短行阈值：{st['breakShortLine']} 字 ｜ "
         f"标点断句检查：{'开' if st['checkPunctuation'] else '关'}",
+        f"- 切点吸附容差：{st['cutTolerance']:g}s",
         "",
         "## 按类型统计",
         "",
@@ -596,5 +948,37 @@ def build_summary(cues: list[dict], issues: list[dict],
         lines.append(f"{n}. **[{sev}] {iss['label']}**（{refs}）  ")
         lines.append(f"   {iss['message']}" +
                      (f"——{iss['detail']}" if iss.get("detail") else ""))
+
+    # 切点校对结果
+    if cut_issues or cuts:
+        lines += ["", "## 切点校对", ""]
+        lines.append(f"- 切点数：{len(cuts or [])} ｜ "
+                     f"吸附容差：{st['cutTolerance']:g}s")
+        cross = [i for i in (cut_issues or []) if i["type"] == "cross_cut"]
+        snap = [i for i in (cut_issues or []) if i["type"] == "cut_snap"]
+        lines.append(f"- 跨切字幕：{len(cross)} 处 ｜ "
+                     f"切点未对齐：{len(snap)} 处")
+        lines.append("")
+        if not cut_issues:
+            lines.append("所有字幕均已避开或对齐切点。")
+        action_labels = {"split": "拆分", "snap_start": "吸附片头",
+                         "snap_end": "吸附片尾"}
+        for n, iss in enumerate(cut_issues or [], 1):
+            sev = "错误" if iss["severity"] == "error" else "提示"
+            cid = iss["cues"][0]
+            ref = (f"第{cid}条 {fmt_srt(by_id[cid]['start'])}"
+                   f"→{fmt_srt(by_id[cid]['end'])}"
+                   if cid in by_id else f"第{cid}条")
+            sug = iss.get("suggestion") or {}
+            tail = ""
+            if sug:
+                tail = f"——建议{action_labels.get(sug.get('action'), '调整')}"
+                if not sug.get("feasible", True):
+                    tail += (f"（冲突：{sug.get('reason', '')}，"
+                             f"应用时将保留原值）")
+            lines.append(
+                f"{n}. **[{sev}] {iss['label']}**"
+                f"（{ref} ｜ 切点 {fmt_srt(iss['cut'])}）  ")
+            lines.append(f"   {iss['message']}{tail}")
     lines.append("")
     return "\n".join(lines)

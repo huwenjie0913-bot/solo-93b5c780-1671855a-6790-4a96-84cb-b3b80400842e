@@ -21,6 +21,7 @@
   <button id="btnRevertAll" class="btn" disabled>全部恢复原始</button>
   <span class="sep"></span>
   <button id="btnSettings" class="btn">阈值设置</button>
+  <button id="btnCuts" class="btn">切点校对</button>
   <span class="spacer"></span>
   <span id="statsBar" class="stats">未载入字幕</span>
   <button id="btnExportSrt" class="btn primary" disabled>导出 SRT</button>
@@ -38,6 +39,31 @@
   <label>断句短行阈值（字）<input type="number" id="setBreakShort" step="1" min="1"></label>
   <label class="chk"><input type="checkbox" id="setPunct"> 启用标点断句检查</label>
   <span class="hint">修改后即时重新校验</span>
+</section>
+
+<!-- 切点校对面板 -->
+<section id="cutPanel" class="hidden">
+  <div class="cut-row">
+    <button id="btnAddCut" class="btn" disabled
+            title="在视频当前帧添加切点（快捷键 C）">✂ 当前帧切点</button>
+    <button id="btnImportCuts" class="btn">批量导入切点</button>
+    <button id="btnClearCuts" class="btn">清空切点</button>
+    <label>吸附容差（秒）<input type="number" id="cutTol" step="0.01" min="0"></label>
+    <span id="cutStats" class="meta"></span>
+    <span class="spacer"></span>
+    <button id="btnApplyAllCuts" class="btn warn" disabled>批量应用全部建议</button>
+  </div>
+  <div id="cutImportBox" class="cut-row hidden">
+    <textarea id="cutImportArea" rows="3"
+      placeholder="每行一个切点（也可用空格/逗号分隔）：秒数或时间码，如&#10;12.5&#10;00:01:12,500"></textarea>
+    <div class="cut-import-btns">
+      <button id="btnDoImportCuts" class="btn primary small">导入</button>
+      <button id="btnCancelImportCuts" class="btn small">取消</button>
+    </div>
+  </div>
+  <div class="cut-row">
+    <span class="hint">切点显示为时间轴上的紫色虚线：拖动移动，右键删除，随缩放保持可见；切点与容差保存在浏览器本地，并随字幕一同参与撤销/重做。</span>
+  </div>
 </section>
 
 <!-- 粘贴字幕面板 -->
@@ -79,6 +105,7 @@
   <div id="rightCol">
     <div class="tabs">
       <button id="tabIssues" class="tab active">异常 <span id="issueCount" class="badge">0</span></button>
+      <button id="tabCuts" class="tab">切点 <span id="cutCount" class="badge">0</span></button>
       <button id="tabCues" class="tab">字幕 <span id="cueCount" class="badge">0</span></button>
       <span class="spacer"></span>
       <span id="issueFilters" class="filters">
@@ -88,6 +115,7 @@
       </span>
     </div>
     <div id="issueList" class="list"></div>
+    <div id="cutList" class="list hidden"></div>
     <div id="cueList" class="list hidden"></div>
   </div>
 </main>
