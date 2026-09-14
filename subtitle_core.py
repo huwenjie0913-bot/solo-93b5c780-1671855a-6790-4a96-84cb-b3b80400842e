@@ -350,6 +350,45 @@ def batch_fix(cues: list[dict], settings: dict | None = None):
     for a, b in zip(seq, seq[1:]):
         successors[a["id"]] = b
 
+    def succ_limit(c: dict) -> float:
+        """c 的起点允许到达的上限（其输入顺序后继的当前起点）。"""
+        s = successors.get(c["id"])
+        if s is None:
+            return float("inf")
+        lim = s["start"]
+        if c["id"] > s["id"]:
+            # 起点相同按 id 排序：id 更大时必须严格更小（1ms）
+            lim -= 0.001
+        return lim
+
+    def shift_chain_forward(first: dict, delta: float) -> bool:
+        """将 first 及被级联顶到的后继整体后移 delta（时长不变）。
+
+        只移动相互衔接的连续段，遇大空档即停；若链上有必须移动但已
+        锁定的字幕，则不移动任何字幕并返回 False。
+        """
+        moves = []
+        d = delta
+        c = first
+        while d > EPS:
+            if c["locked"]:
+                return False
+            moves.append((c, d))
+            succ = successors.get(c["id"])
+            if succ is None:
+                break
+            need = c["end"] + d + st["minGap"]  # c 后移后的 end + 间隔
+            if succ["start"] >= need - EPS:
+                break
+            d = need - succ["start"]
+            c = succ
+        for c, d in moves:
+            before = (c["start"], c["end"])
+            c["start"] = _r3(c["start"] + d)
+            c["end"] = _r3(c["end"] + d)
+            log(c, before, "为消除前序重叠，利用后方空档整体后移")
+        return True
+
     for _ in range(MAX_FIX_PASSES):
         ordered.sort(key=lambda c: (c["start"], c["id"]))
         mutated = False
@@ -362,17 +401,9 @@ def batch_fix(cues: list[dict], settings: dict | None = None):
                 continue
             if prev["locked"] and cur["locked"]:
                 continue
-            succ = successors.get(cur["id"])
-            if succ is None:
-                succ_start = float("inf")
-            else:
-                succ_start = succ["start"]
-                if cur["id"] > succ["id"]:
-                    # 起点相同按 id 排序：id 更大时必须严格更小（1ms）
-                    succ_start -= 0.001
             if prev["locked"]:
                 # 后移本条，但不越过后继起点
-                new_start = min(prev["end"] + st["minGap"], succ_start)
+                new_start = min(prev["end"] + st["minGap"], succ_limit(cur))
                 if new_start > cur["start"] + EPS:
                     before = (cur["start"], cur["end"])
                     shift = new_start - cur["start"]
@@ -398,22 +429,51 @@ def batch_fix(cues: list[dict], settings: dict | None = None):
                 lo = max(prev["start"], cur["start"])
                 hi = min(prev["end"], cur["end"])
                 mid = (lo + hi) / 2
-                # 可行边界区间：分割后两条都必须至少保留 MIN_CUE_DUR 时长，
+                # 中点分割的可行边界区间：两条都至少保留 MIN_CUE_DUR，
                 # 即 prev.end >= prev.start + MIN_CUE_DUR 且
-                #   cur.start <= cur.end - MIN_CUE_DUR；
-                # 此外 cur.start 不得越过其输入顺序后继的起点（保持顺序）。
+                #   cur.start <= cur.end - MIN_CUE_DUR
                 lo_b = prev["start"] + MIN_CUE_DUR
-                hi_b = min(cur["end"] - MIN_CUE_DUR, succ_start)
-                if hi_b - lo_b < -EPS:
-                    continue  # 本轮无法分割，待后继移动或最终统一报告
-                # 间隔最大不超过可用空间；边界钳制在可行区间内
-                gap = min(st["minGap"], max(0.0, hi_b - lo_b))
-                b = min(max(mid, lo_b + gap / 2), hi_b - gap / 2)
-                prev["end"] = _r3(b - gap / 2)
-                cur["start"] = _r3(b + gap / 2)
-                log(prev, before_p, "与后一条重叠，按重叠区间中点重新划分边界")
-                log(cur, before_c, "与前一条重叠，按重叠区间中点重新划分边界")
-                mutated = True
+                hi_b_own = cur["end"] - MIN_CUE_DUR
+                done = False
+                if hi_b_own - lo_b >= -EPS:
+                    # 自身跨度够分割；若后继挡住边界，先把后继链整体
+                    # 后移腾位（密集嵌套链会逐级把尾部推向空档）
+                    gap0 = min(st["minGap"], hi_b_own - lo_b)
+                    b_ideal = min(max(mid, lo_b + gap0 / 2),
+                                  hi_b_own - gap0 / 2)
+                    need = b_ideal + gap0 / 2
+                    lim = succ_limit(cur)
+                    if need > lim + EPS:
+                        succ = successors.get(cur["id"])
+                        if succ is not None and \
+                                shift_chain_forward(succ, need - lim):
+                            lim = succ_limit(cur)
+                    hi_b = min(hi_b_own, lim)
+                    if hi_b - lo_b >= -EPS:
+                        gap = min(st["minGap"], max(0.0, hi_b - lo_b))
+                        b = min(max(mid, lo_b + gap / 2), hi_b - gap / 2)
+                        prev["end"] = _r3(b - gap / 2)
+                        cur["start"] = _r3(b + gap / 2)
+                        log(prev, before_p,
+                            "与后一条重叠，按重叠区间中点重新划分边界")
+                        log(cur, before_c,
+                            "与前一条重叠，按重叠区间中点重新划分边界")
+                        mutated = True
+                        done = True
+                if not done:
+                    # 中点分割不可行（窗口不足两条最短时长，或后继被
+                    # 锁定挡住）：prev 压缩到最短时长（如需要），cur 及
+                    # 其衔接链整体移到 prev 之后，利用后方空档保持时长
+                    if hi_b_own - lo_b < -EPS and \
+                            prev["end"] > lo_b + EPS:
+                        prev["end"] = _r3(lo_b)
+                        log(prev, before_p,
+                            "重叠区间跨度过小，本条压缩到最短时长")
+                        mutated = True
+                    target = prev["end"] + st["minGap"]
+                    if target > cur["start"] + EPS and \
+                            shift_chain_forward(cur, target - cur["start"]):
+                        mutated = True
         if not mutated:
             break
 
