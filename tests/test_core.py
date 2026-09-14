@@ -228,6 +228,69 @@ def test_batch_fix_locked_not_extended():
     assert (c1["start"], c1["end"]) == (0.0, 0.3)  # 锁定条不参与调整
 
 
+def test_batch_fix_nested_overlap():
+    """回归：第二条完全嵌套在第一条内（0-10 与 1-2），不得产出倒置时间。"""
+    cues = [cue(1, 0.0, 10.0, "外层长字幕。"), cue(2, 1.0, 2.0, "内层短字幕。")]
+    fixed, changes = core.batch_fix(cues)
+    by_id = {c["id"]: c for c in fixed}
+    assert all(c["start"] < c["end"] for c in fixed)        # 时间必须有效
+    assert by_id[1]["end"] <= by_id[2]["start"]             # 重叠已消除
+    assert [c["text"] for c in fixed] == ["外层长字幕。", "内层短字幕。"]
+    assert [c["id"] for c in fixed] == [1, 2]               # 顺序不变
+    assert changes                                          # 有改动记录
+    # 修复结果在默认阈值下不再有叠轴
+    assert not [i for i in core.validate(fixed) if i["type"] == "overlap"]
+
+
+def test_batch_fix_nested_same_start():
+    """起点相同的嵌套字幕也要能分开且保持有效。"""
+    cues = [cue(1, 1.0, 2.0, "甲"), cue(2, 1.0, 5.0, "乙")]
+    fixed, _ = core.batch_fix(cues)
+    assert all(c["start"] < c["end"] for c in fixed)
+    assert fixed[0]["end"] <= fixed[1]["start"]
+
+
+def test_batch_fix_identical_cues():
+    """完全重合的两条字幕。"""
+    cues = [cue(1, 1.0, 2.0, "甲"), cue(2, 1.0, 2.0, "乙")]
+    fixed, _ = core.batch_fix(cues)
+    assert all(c["start"] < c["end"] for c in fixed)
+    assert fixed[0]["end"] <= fixed[1]["start"]
+
+
+def test_batch_fix_infeasible_left_untouched():
+    """总跨度不足两条最短时长时：不强行分割、不产出非法时间，记录未处理。"""
+    cues = [cue(1, 0.0, 0.05, "甲"), cue(2, 0.02, 0.06, "乙")]
+    fixed, changes = core.batch_fix(cues)
+    assert all(c["start"] < c["end"] for c in fixed)        # 不破坏原有有效性
+    assert any(c["before"] is None for c in changes)        # 有未处理记录
+
+
+def test_batch_fix_output_always_valid():
+    """性质测试：随机重叠场景下输出时间始终有效、无重叠且顺序不变。"""
+    import random
+    rng = random.Random(42)
+    for _ in range(200):
+        n = rng.randint(2, 6)
+        cues = []
+        for i in range(n):
+            s = round(rng.uniform(0, 20), 3)
+            e = round(s + rng.uniform(0.05, 8), 3)
+            cues.append(cue(i + 1, s, e, f"第{i + 1}条字幕。"))
+        fixed, _ = core.batch_fix(cues)
+        assert all(c["start"] < c["end"] for c in fixed), cues
+        ordered = sorted(fixed, key=lambda c: c["start"])
+        assert all(a["end"] <= b["start"] + 1e-4
+                   for a, b in zip(ordered, ordered[1:])), cues
+        # 输出时间顺序必须与输入 (start, id) 顺序一致
+        in_seq = [c["id"] for c in sorted(cues, key=lambda c: (c["start"], c["id"]))]
+        out_seq = [c["id"] for c in sorted(fixed, key=lambda c: (c["start"], c["id"]))]
+        assert out_seq == in_seq, cues
+        # 文字不变
+        by_id = {c["id"]: c for c in cues}
+        assert all(c["text"] == by_id[c["id"]]["text"] for c in fixed)
+
+
 # ---------------------------------------------------------------- 摘要
 
 def test_summary_contains_counts_and_reasons():
@@ -270,6 +333,20 @@ def test_api_batch_fix(client):
     fixed = data["cues"]
     assert fixed[0]["end"] <= fixed[1]["start"]
     assert data["changes"]
+
+
+def test_api_batch_fix_nested(client):
+    """接口回归：完全嵌套的两条未锁定字幕不得返回倒置时间。"""
+    res = client.post("/api/batch_fix", json={
+        "cues": [cue(1, 0.0, 10.0, "外层长字幕。"),
+                 cue(2, 1.0, 2.0, "内层短字幕。")],
+        "settings": {}})
+    assert res.status_code == 200
+    fixed = res.get_json()["cues"]
+    assert all(c["start"] < c["end"] for c in fixed)
+    ordered = sorted(fixed, key=lambda c: c["start"])
+    assert ordered[0]["end"] <= ordered[1]["start"]
+    assert [c["text"] for c in ordered] == ["外层长字幕。", "内层短字幕。"]
 
 
 def test_api_export_srt_vtt(client):

@@ -12,6 +12,8 @@ import re
 from datetime import datetime
 
 EPS = 1e-4  # 时间比较容差（秒）
+MIN_CUE_DUR = 0.04  # 自动调整保留的最短时长（秒，约一帧）
+MAX_FIX_PASSES = 50  # 消重叠迭代上限（保险用，正常远早于此收敛）
 
 # 行尾出现这些标点视为自然断句位置
 BREAK_OK_CHARS = "，。！？；：、…—–,.!?;:）》」』%”’\"'"
@@ -337,43 +339,100 @@ def batch_fix(cues: list[dict], settings: dict | None = None):
         })
 
     # ---- 第一遍：消除相邻重叠 ----
-    for i in range(1, len(ordered)):
-        prev, cur = ordered[i - 1], ordered[i]
-        if cur["start"] >= prev["end"] - EPS:
+    # 分割会把后一条的起点后移，可能越过再后面字幕的起点，使列表顺序
+    # 与时间顺序暂时不符、并产生跨越多条的重叠；因此每轮重排并扫描，
+    # 迭代至一整轮没有任何调整为止（分割单调收缩，必然收敛）。
+    #
+    # 顺序保持：以输入时的 (start, id) 顺序为准，每条字幕的起点最多
+    # 移到其输入顺序后继的当前起点处，不会越过，保证字幕先后次序不变。
+    successors: dict[int, dict] = {}
+    seq = sorted(fixed, key=lambda c: (c["start"], c["id"]))
+    for a, b in zip(seq, seq[1:]):
+        successors[a["id"]] = b
+
+    for _ in range(MAX_FIX_PASSES):
+        ordered.sort(key=lambda c: (c["start"], c["id"]))
+        mutated = False
+        for i in range(1, len(ordered)):
+            prev, cur = ordered[i - 1], ordered[i]
+            # 只有真正相交才处理（顺序暂时错乱但互不相交的跳过即可，
+            # 下一轮重排后自然恢复）
+            if cur["start"] >= prev["end"] - EPS or \
+                    prev["start"] >= cur["end"] - EPS:
+                continue
+            if prev["locked"] and cur["locked"]:
+                continue
+            succ = successors.get(cur["id"])
+            if succ is None:
+                succ_start = float("inf")
+            else:
+                succ_start = succ["start"]
+                if cur["id"] > succ["id"]:
+                    # 起点相同按 id 排序：id 更大时必须严格更小（1ms）
+                    succ_start -= 0.001
+            if prev["locked"]:
+                # 后移本条，但不越过后继起点
+                new_start = min(prev["end"] + st["minGap"], succ_start)
+                if new_start > cur["start"] + EPS:
+                    before = (cur["start"], cur["end"])
+                    shift = new_start - cur["start"]
+                    cur["start"] = _r3(cur["start"] + shift)
+                    cur["end"] = _r3(cur["end"] + shift)
+                    log(cur, before,
+                        f"第 {prev['id']} 条已锁定，将本条整体后移以消除重叠")
+                    mutated = True
+            elif cur["locked"]:
+                before = (prev["start"], prev["end"])
+                prev["end"] = _r3(cur["start"] - st["minGap"])
+                if prev["end"] <= prev["start"] + EPS:
+                    prev["end"] = _r3(prev["start"] + MIN_CUE_DUR)
+                if abs(prev["end"] - before[1]) > EPS:
+                    log(prev, before,
+                        f"第 {cur['id']} 条已锁定，提前本条结束点以消除重叠")
+                    mutated = True
+            else:
+                before_p = (prev["start"], prev["end"])
+                before_c = (cur["start"], cur["end"])
+                # 真实重叠区间：两区间的交集。一条包含另一条（嵌套）时，
+                # 交集等于被包含条的整个范围，而不是 [cur.start, prev.end]。
+                lo = max(prev["start"], cur["start"])
+                hi = min(prev["end"], cur["end"])
+                mid = (lo + hi) / 2
+                # 可行边界区间：分割后两条都必须至少保留 MIN_CUE_DUR 时长，
+                # 即 prev.end >= prev.start + MIN_CUE_DUR 且
+                #   cur.start <= cur.end - MIN_CUE_DUR；
+                # 此外 cur.start 不得越过其输入顺序后继的起点（保持顺序）。
+                lo_b = prev["start"] + MIN_CUE_DUR
+                hi_b = min(cur["end"] - MIN_CUE_DUR, succ_start)
+                if hi_b - lo_b < -EPS:
+                    continue  # 本轮无法分割，待后继移动或最终统一报告
+                # 间隔最大不超过可用空间；边界钳制在可行区间内
+                gap = min(st["minGap"], max(0.0, hi_b - lo_b))
+                b = min(max(mid, lo_b + gap / 2), hi_b - gap / 2)
+                prev["end"] = _r3(b - gap / 2)
+                cur["start"] = _r3(b + gap / 2)
+                log(prev, before_p, "与后一条重叠，按重叠区间中点重新划分边界")
+                log(cur, before_c, "与前一条重叠，按重叠区间中点重新划分边界")
+                mutated = True
+        if not mutated:
+            break
+
+    # ---- 统一报告未能消除的重叠 ----
+    ordered.sort(key=lambda c: (c["start"], c["id"]))
+    for prev, cur in zip(ordered, ordered[1:]):
+        if cur["start"] >= prev["end"] - EPS or \
+                prev["start"] >= cur["end"] - EPS:
             continue
         if prev["locked"] and cur["locked"]:
-            changes.append({"cue": cur["id"], "before": None, "after": None,
-                            "reason": f"第 {prev['id']}、{cur['id']} 条均已锁定，重叠未处理"})
-            continue
-        if prev["locked"]:
-            before = (cur["start"], cur["end"])
-            shift = prev["end"] + st["minGap"] - cur["start"]
-            cur["start"] = _r3(cur["start"] + shift)
-            cur["end"] = _r3(cur["end"] + shift)
-            log(cur, before, f"第 {prev['id']} 条已锁定，将本条整体后移以消除重叠")
-        elif cur["locked"]:
-            before = (prev["start"], prev["end"])
-            prev["end"] = _r3(cur["start"] - st["minGap"])
-            if prev["end"] <= prev["start"] + EPS:
-                prev["end"] = _r3(prev["start"] + 0.04)
-                changes.append({"cue": prev["id"], "before": None, "after": None,
-                                "reason": f"第 {cur['id']} 条已锁定且空间不足，重叠未能完全消除"})
-            log(prev, before, f"第 {cur['id']} 条已锁定，提前本条结束点以消除重叠")
+            reason = f"第 {prev['id']}、{cur['id']} 条均已锁定，重叠未处理"
+        elif prev["locked"] or cur["locked"]:
+            lid = prev["id"] if prev["locked"] else cur["id"]
+            reason = f"第 {lid} 条已锁定且空间不足，重叠未能完全消除"
         else:
-            before_p = (prev["start"], prev["end"])
-            before_c = (cur["start"], cur["end"])
-            lo, hi = cur["start"], prev["end"]  # 重叠区间
-            mid = (lo + hi) / 2
-            if hi - lo >= st["minGap"]:
-                prev["end"] = _r3(mid - st["minGap"] / 2)
-                cur["start"] = _r3(mid + st["minGap"] / 2)
-            else:
-                prev["end"] = cur["start"] = _r3(mid)
-            if prev["end"] <= prev["start"] + EPS or cur["start"] >= cur["end"] - EPS:
-                changes.append({"cue": cur["id"], "before": None, "after": None,
-                                "reason": "重叠区间过大，自动分割后时长无效，请手动处理"})
-            log(prev, before_p, "与后一条重叠，按重叠区间中点重新划分边界")
-            log(cur, before_c, "与前一条重叠，按重叠区间中点重新划分边界")
+            reason = ("重叠区间跨度不足或受相邻字幕阻挡，"
+                      "无法自动分割，请手动处理")
+        changes.append({"cue": cur["id"], "before": None, "after": None,
+                        "reason": reason})
 
     # ---- 第二遍：利用前后空档补足过短时长 ----
     for i, cur in enumerate(ordered):
